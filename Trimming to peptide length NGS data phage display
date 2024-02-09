@@ -1,0 +1,277 @@
+
+#NGS fastq file must be present in path
+setwd("path")
+getwd()
+
+
+
+###Libraries
+#Bioconductor: https://www.bioconductor.org/
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install("ShortRead")
+BiocManager::install("Rqc")
+BiocManager::install("Biostrings")
+BiocManager::install("FastqCleaner")
+BiocManager::install("BiocParallel")
+
+
+#Libraries
+library(stringr)
+library(htmltools)
+library(Biostrings)
+library(dplyr)
+library(ShortRead)
+library(R.utils)
+library(Rqc)
+library(FastqCleaner)
+library(tidyverse)
+library(ggplot2)
+library(BiocParallel)
+
+
+
+
+
+
+##Call data
+Toy.ini <- read.delim("file.fastq.gz")
+dim(Toy.ini)
+
+
+##Trim vector contaminated sequences
+#Select only sequence and quality score
+Toy <- Toy.ini %>% filter(row_number() %% 2 == 1) ## Select odd rows
+colnames(Toy) <- NULL
+head(Toy, 6)
+
+#Select peptide only
+ToyUL <- unlist(Toy)
+Toy.tri <- sub(".*DNA", "", ToyUL) #Delete adaptor before first codon
+Toy.trim <- strtrim(Toy.tri, "peptide length to fill as numeric") #Leaves peptide length only 
+Toy.trim <- data.frame(Toy.trim)
+head(Toy.trim, 20)
+
+#Generate FastQ file back for quality analysis
+reads <- Toy.trim %>% filter(row_number() %% 2 == 1) ## Select odd rows: reads
+qual <- Toy.trim %>% filter(row_number() %% 2 == 0) ## Select even rows: quality
+id <- rep("Toy", nrow(reads)) #empty id column
+
+#Clean sequences
+Toy.df <- data.frame(cbind(id, reads, qual, stringsAsFactors = FALSE))
+colnames(Toy.df) <- c('Id', 'reads','qual')
+Toy.df$Nb <- nchar(gsub("[^A-Z]","", Toy.df$reads))
+head(Toy.df, 10)
+
+#Delete any sequence not starting by first triplet codon "DNA"
+Toy.df <- Toy.df[grep("^DNA+", Toy.df$reads), ]
+head(Toy.df, 10)
+
+#How many dirty sequences (less than peptide length)
+print(paste("Nb of sequences less than peptide length in bp is", 
+            length(which(Toy.df$Nb < "peptide length to fill as numeric"))))
+
+#Removal of these sequences
+Toy.df <- Toy.df %>%
+  filter(Nb == "peptide length to fill as numeric")
+summary(Toy.df$Nb)
+
+
+#Delete any sequence NOT finishing by last triplet codon "DNA"
+Toy.df <- Toy.df[grepl("DNA$", Toy.df$reads), ]
+
+
+#Remove any sequences not fitting a peptide length
+apply(Toy.df, 2, function(x) which.max(nchar(x))) # Maximum length of string in all columns
+#Must be 1 in all
+apply(Toy.df, 2, function(x) which.min(nchar(x))) # Minimum length of string in all columns
+#Must be 1 in all
+
+
+#Nb of reads kept
+print(paste("Percentage of reads kept is ", 
+            round(((2 * nrow(Toy.df) / nrow(Toy)) * 100), digits = 1)))
+
+
+#Leave peptide length only, first triplet codon on the front and last triplet codon at the end is removed
+Toy.df <- Toy.df %>%
+  mutate(Reads = substr(Toy.df$reads, 4, nchar(Toy.df$reads) - 3),
+         Quality = substr(Toy.df$qual, 4, nchar(Toy.df$qual) - 3),
+         Nb = rep(21, nrow(Toy.df)), .after = Quality)
+
+Toy.df <- Toy.df %>%
+  select(-(reads:qual))
+
+head(Toy.df, 10)
+cat("\014")
+
+
+##Produce diagnostic plots regarding Phred score (quality). Write FastQC sequences after Phred cutoff
+#Phred quality
+head(Toy.df$Quality, 20)
+Qualset <- PhredQuality(Toy.df$Quality)
+
+qualityEncoding <- encoding(Qualset)
+PhredQuality(0:93)
+qualityEncoding
+
+cat("\014")
+
+#Write FastQ
+DNAset <- DNAStringSet(Toy.df$Reads)
+Toy.Peptide <- QualityScaledDNAStringSet(DNAset, Qualset)
+names(Toy.Peptide) <- rep("Toy", nrow(Toy.df))
+
+writeXStringSet(Toy.Peptide, format="fastq", 
+                file="Toy.Peptide.fastq", qualities = quality(Toy.Peptide))
+
+Toy.peptide <- readFastq("Toy.Peptide.fastq")
+
+###Data exploration
+##Number of sequences
+sread(Toy.peptide)
+##Quality score encoding
+quality(Toy.peptide)
+
+#Quality Phred score table
+Phred_table <- data.frame(Quality = c(10, 20, 30, 40, 50),
+                          Error = c("1in10^1", "1in10^2", "1in10^3", "1in10^4", "1in10^5"),
+                          Accuracy = c(90, 99, 99.9, 99.99, 99.999))
+Phred_table #Quick reminder of rate of error regarding Phred score
+
+#Graphical representations
+files <- list.files(".", "Toy.Peptide.fastq", full.names = TRUE)
+qa <- rqcQA(files, 
+            n = "up to user to fill as numeric", #Check dimension of data
+            workers = multicoreWorkers())
+
+
+#% of reads exceeding quality (Phred score)
+rqcReadQualityPlot(qa)
+
+#Boxplot
+rqcReadQualityBoxPlot(qa)
+
+#Average quality pattern by showing on the X-axis length of reads and on the Y-axis the reads average quality
+rqcCycleAverageQualityPlot(qa)
+
+
+##Phred score trimming
+#Define according to diagnostic plots Phred score cutoff
+qualityCutoff <- "up to user to fill as numeric according to previous plots" #Remove reads with quality lower or equal to cut off
+
+#Custom filter: minimum calibrated base call quality >= qualityCutoff
+Phred.Cutoff <- srFilter(function(x) {
+  apply(as(quality(x), "matrix"), 1, min, na.rm = TRUE) >= qualityCutoff
+}, name = "GoodQualityBases")
+Phred.Cutoff
+
+#Subset with only quality stated
+Toy.Phred.trim <- Toy.peptide[Phred.Cutoff(Toy.peptide)]
+
+#Nb of reads kept
+print(paste("Percentage of reads kept is ", 
+            round(((length(Toy.Phred.trim) / length(Toy.peptide)) * 100), digits = 0)))
+
+writeFastq(Toy.Phred.trim, file="./Toy.Phred.trim.fastq")
+
+
+##Compare raw and Phred cutoff data
+#Location folder to write in list.files()!
+files1 <- list.files(".", ".fastq", full.names = TRUE)
+qa1 <- rqcQA(files1, 
+             n = "up to user to fill as numeric", #Check dimension of data
+             workers = multicoreWorkers()) 
+
+rqcReadQualityPlot(qa1)
+rqcReadQualityBoxPlot(qa1)
+rqcCycleAverageQualityPlot(qa1)
+cat("\014")
+
+##Translate with both genetic codes DNA sequences final list of peptides
+#There are 2 versions of the genetic code: classic one and supE gene (TGA -> Q)
+
+supE_gene <- c(
+  TTT="F", TTC="F", TTA="L", TTG="L", TCT="S", TCC="S", TCA="S", TCG="S",
+  TAT="Y", TAC="Y", TAA="*", TAG="Q", TGT="C", TGC="C", TGA="*", TGG="W",
+  CTT="L", CTC="L", CTA="L", CTG="L", CCT="P", CCC="P", CCA="P", CCG="P",
+  CAT="H", CAC="H", CAA="Q", CAG="Q", CGT="R", CGC="R", CGA="R", CGG="R",
+  ATT="I", ATC="I", ATA="I", ATG="M", ACT="T", ACC="T", ACA="T", ACG="T",
+  AAT="N", AAC="N", AAA="K", AAG="K", AGT="S", AGC="S", AGA="R", AGG="R",
+  GTT="V", GTC="V", GTA="V", GTG="V", GCT="A", GCC="A", GCA="A", GCG="A",
+  GAT="D", GAC="D", GAA="E", GAG="E", GGT="G", GGC="G", GGA="G", GGG="G")
+
+attr(supE_gene, "alt_init_codons") <- c("TTG", "CTG")
+cat("\014")
+
+#GENETIC_CODE
+print(GENETIC_CODE)
+#supE gene
+print(supE_gene)
+
+#Difference between these 2 codon tables:
+GENETIC_CODE[["TAG"]]
+supE_gene[["TAG"]]
+
+#Translate with both genetic codes DNA sequences final list of peptides
+#DNA files
+Toy.Phred.trim <- readFastq("Toy.Phred.trim.fastq")
+
+Toy.Phred.trim.str <- Toy.Phred.trim@sread
+df <- as.character(Toy.Phred.trim.str)
+
+
+#Remove NAs if any:
+Toy.clean <- na.omit(df)
+Toy.clean <- DNAStringSet(Toy.clean)
+Toy.clean.Freq <- table(Toy.clean) #Frequency table
+Toy.clean.Freq <- Toy.clean.Freq %>% 
+  as.data.frame() %>% arrange(desc(Freq)) #Before export, sorting
+
+
+
+#AA files: Genetic code
+Toy.GENE <- translate(Toy.clean, 
+                      genetic.code = GENETIC_CODE) #Genetic code
+Toy.GENE.Freq <- table(Toy.GENE) #Frequency table
+Toy.GENE.Freq <- Toy.GENE.Freq %>% 
+  as.data.frame() %>% arrange(desc(Freq)) #Before export, sorting
+
+
+
+#AA files: SupE gene
+Toy.supE <- translate(Toy.clean, genetic.code = supE_gene) #SupE gene
+Toy.supE.Freq <- table(Toy.supE) #Frequency table
+Toy.supE.Freq <- Toy.supE.Freq %>% 
+  as.data.frame() %>% arrange(desc(Freq)) #Before export, sorting
+cat("\014")
+
+
+#Look at generated data
+#DNA genetic code
+head(Toy.clean.Freq, 10)
+#AA genetic code
+head(Toy.GENE.Freq, 10)
+#AA SupE gene
+head(Toy.supE.Freq, 10)
+cat("\014")
+
+
+##Export DNA sequence, AA sequence (genetic code & supE gene TGA -> Q)
+#Export as .csv 3 files sorted with counts
+#Exported files will be in folder called
+
+#DNA genetic code 
+write.csv(Toy.clean.Freq,"./Toy.DNA.csv", row.names = FALSE)
+
+#AA genetic code (gc)
+write.csv(Toy.GENE.Freq,"./Toy.AAgc.csv", row.names = FALSE)
+
+#AA supE gene codon table (supE)
+write.csv(Toy.supE.Freq,"./Toy.AAsupE.csv", row.names = FALSE)
+
+
+###################
+sessionInfo()
+###################
