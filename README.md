@@ -1,6 +1,3 @@
-Sure, here's a basic template for a GitHub manual for your R script:
-
----
 
 # NGS Data Processing with R
 
